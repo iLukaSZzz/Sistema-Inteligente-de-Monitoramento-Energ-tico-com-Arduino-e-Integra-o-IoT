@@ -1,432 +1,483 @@
 /*
- * =============================================================
- *  Monitor Energético Residencial — ESP32 + ACS712 + Blynk 2.0
- * =============================================================
- *
- * Circuitos monitorados:
- *   0 → Iluminação   (pino 34, relé 25)
- *   1 → Tomadas      (pino 35, relé 26)
- *   2 → Cozinha      (pino 32, relé 27)
- *   3 → Banheiro     (pino 33, relé 14)
- *
- * Mapa de pinos virtuais Blynk:
- *   V0–V3   → Corrente (A) por circuito
- *   V10–V13 → Energia acumulada (kWh) por circuito
- *   V20     → Tarifa (R$/kWh) — escrita pelo app
- *   V21     → Reset de energia — escrita pelo app (1 = resetar)
- *   V30     → Energia total (kWh)
- *   V31     → Custo total (R$)
- *   V40–V43 → Controle dos relés — escritos pelo app
- *
- * Dependências (Arduino IDE):
- *   - Blynk (>=1.3.2)
- *   - ESP32 board package
- *
- * Hardware:
- *   - ESP32 DevKit
- *   - 4× ACS712-20A (sensibilidade 100 mV/A)
- *   - 4× módulo relé (ativo em LOW)
- * =============================================================
- */
+=========================================================
+  MONITOR ENERGÉTICO IoT - v11 (FINAL)
+  Hardware : ESP32 + 2x ACS712-30A + 2x Relé + LEDs
+  Plataforma: Blynk + Monitor Serial + Telnet WiFi
+  Alimentação sensor: 4.5V via VIN USB
+=========================================================
 
-// --- Credenciais Blynk 2.0 -------------------------
-#define BLYNK_TEMPLATE_ID   "TMPLxxxxxxxx"
-#define BLYNK_TEMPLATE_NAME "Monitor Energia"
-#define BLYNK_AUTH_TOKEN    "TOKEN"
+  MAPA DE PINOS:
+  ┌─────────────────┬──────┐
+  │ ACS712 C1 (OUT) │ G32  │
+  │ ACS712 C2 (OUT) │ G34  │
+  │ Relé C1         │ G25  │
+  │ Relé C2         │ G26  │
+  │ LED Verde C1    │ G18  │
+  │ LED Vermelho C1 │ G19  │
+  │ LED Verde C2    │ G21  │
+  │ LED Vermelho C2 │ G22  │
+  └─────────────────┴──────┘
 
+  MAPA BLYNK:
+  ┌──────────────────────────┬─────┐
+  │ Corrente C1              │ V0  │
+  │ Corrente C2              │ V1  │
+  │ Energia C1               │ V10 │
+  │ Energia C2               │ V11 │
+  │ Tarifa kWh (entrada)     │ V20 │
+  │ Reset energia (botão)    │ V21 │
+  │ Potência C1              │ V50 │
+  │ Potência C2              │ V51 │
+  │ Custo C1                 │ V60 │
+  │ Custo C2                 │ V61 │
+  │ Energia Total            │ V30 │
+  │ Custo Total              │ V31 │
+  │ Comando Relé C1          │ V40 │
+  │ Comando Relé C2          │ V41 │
+  └──────────────────────────┴─────┘
+
+  CALIBRAÇÃO POR FAIXA:
+  Para ajustar: SENS_nova = SENS_atual × (ESP / Físico)
+  Faixas C1: < 0.20A | 0.20~0.40A | > 0.40A
+  Faixas C2: < 0.20A | 0.20~0.40A | > 0.40A
+
+  TELNET (backup do Blynk):
+  Conecte na porta 23 do IP do ESP32
+  Notebook : telnet <IP>
+  Celular  : app "Telnet Client" ou "JuiceSSH"
+=========================================================
+*/
+
+// ─── BLYNK ────────────────────────────────────────────────────────
+#define BLYNK_TEMPLATE_ID   "TMPL2Km9O6sIc"
+#define BLYNK_TEMPLATE_NAME "Monitoramento Energético"
+#define BLYNK_AUTH_TOKEN    "Q0a9c5m0rv4PpArBdyMJQtmcElu1zjAD"
 #define BLYNK_PRINT Serial
 
 #include <WiFi.h>
 #include <BlynkSimpleEsp32.h>
 
-// ====================================================
-// CONFIGURAÇÕES
-// ====================================================
+// ─── REDE ─────────────────────────────────────────────────────────
+char ssid[] = "iLukaS";
+char pass[] = "998308357@Lucas";
 
-const char WIFI_SSID[] = "WIFI";
-const char WIFI_PASS[] = "SENHA";
+// ─── TELNET (Monitor Serial via WiFi, porta 23) ───────────────────
+WiFiServer telnetServer(23);
+WiFiClient telnetClient;
 
-// Pinos analógicos dos sensores ACS712
-const int PINO_SENSOR[4] = {34, 35, 32, 33};
+// ─── PINOS ────────────────────────────────────────────────────────
+#define ACS_C1          32
+#define ACS_C2          34
+#define RELE_C1         25
+#define RELE_C2         26
+#define LED_VERDE_C1    18
+#define LED_VERMELHO_C1 19
+#define LED_VERDE_C2    21
+#define LED_VERMELHO_C2 22
 
-// Pinos digitais dos relés
-const int PINO_RELE[4] = {25, 26, 27, 14};
+// ─── CONSTANTES FÍSICAS ───────────────────────────────────────────
+const float TENSAO_REDE = 127.0;  // Tensão da rede elétrica (V)
+float tarifaKwh         = 0.95;   // R$/kWh — ajustável pelo Blynk V20
+float limiteC1          = 10.0;    // Limite de sobrecarga C1 (A)
+float limiteC2          = 10.0;    // Limite de sobrecarga C2 (A)
 
-// Nome dos circuitos
-const char* NOME_CIRCUITO[4] = {
-  "Iluminacao",
-  "Tomadas",
-  "Cozinha",
-  "Banheiro"
-};
+// ─── SENSIBILIDADE INDIVIDUAL POR CANAL ──────────────────────────
+// Para recalibrar: SENS_nova = SENS_atual × (leitura_ESP / leitura_fisica)
+const float SENSIBILIDADE_C1 = 0.114;
+const float SENSIBILIDADE_C2 = 0.123;
 
-// Tensão da rede elétrica
-const float TENSAO_REDE = 127.0;
+// ─── ADC ──────────────────────────────────────────────────────────
+const float VOLTS_PER_STEP = 3.3 / 4095.0;
+const float ZONA_MORTA     = 0.10;
 
-// Sensibilidade do ACS712-20A
-const float SENSIBILIDADE_MV_A = 100.0;
+// ─── OFFSETS (calibrados automaticamente no boot) ─────────────────
+float ADC_ZERO_C1 = 2964.24;
+float ADC_ZERO_C2 = 2954.64;
 
-// Quantidade de amostras RMS
-const int AMOSTRAS_RMS = 1000;
+bool calibrando = false;
 
-// Limite máximo de corrente por circuito
-const float LIMITE_CORRENTE[4] = {
-  10.0,
-  16.0,
-  20.0,
-  10.0
-};
-
-// Intervalo de atualização
-const unsigned long INTERVALO_MS = 2000UL;
-
-// Tarifa energética
-float tarifa = 0.95;
-
-// ====================================================
-// VARIÁVEIS GLOBAIS
-// ====================================================
-
-float energiaAcumulada[4] = {0.0, 0.0, 0.0, 0.0};
-
-bool alertaDisparado[4] = {
-  false,
-  false,
-  false,
-  false
-};
-
-bool releAtivo[4] = {
-  true,
-  true,
-  true,
-  true
-};
-
-unsigned long ultimaAtualizacao = 0;
-
+// ─── VARIÁVEIS DE ENERGIA ─────────────────────────────────────────
+float correnteC1 = 0, correnteC2 = 0;
+float potenciaC1 = 0, potenciaC2 = 0;
+float energiaC1  = 0, energiaC2  = 0;
+float custoC1    = 0, custoC2    = 0;
+float correnteFiltradaC1 = 0;
+float correnteFiltradaC2 = 0;
+unsigned long ultimoTempo = 0;
+// Controle de estabilização dos relés
+unsigned long ultimoAcionamentoReleC1 = 0;
+unsigned long ultimoAcionamentoReleC2 = 0;
+const unsigned long TEMPO_ESTABILIZACAO_RELE = 3000; // 3 segundos
 BlynkTimer timer;
 
-// ====================================================
-// FUNÇÃO DE LEITURA RMS
-// ====================================================
+// ─── TABELA DE CALIBRAÇÃO POR FAIXA ──────────────────────────────
+// Ajuste estes fatores conforme medições com amperímetro físico.
+// Fórmula: fator = corrente_fisica / corrente_ESP_nessa_faixa
 
-float lerCorrenteRMS(int pino) {
+// C1 — medições base:
+// Físico 0.23A → ESP 0.25A → fator = 0.92
+// Físico 0.32A → ESP 0.32A → fator = 1.00
+float C1_FATOR_BAIXO = 0.88;  // faixa < 0.20A
+float C1_FATOR_MEDIO = 0.95;  // faixa 0.20A ~ 0.40A
+float C1_FATOR_ALTO  = 1.00;  // faixa > 0.40A
 
-  const float VREF       = 3.3;
-  const float ADC_MAX    = 4095.0;
-  const float OFFSET_ADC = ADC_MAX / 2.0;
+// C2 — medições base:
+// Físico 0.11A → ESP 0.19A → fator = 0.58
+// Físico 0.26A → ESP 0.23A → fator = 1.13
+float C2_FATOR_BAIXO = 0.60;  // faixa < 0.20A
+float C2_FATOR_MEDIO = 1.05;  // faixa 0.20A ~ 0.40A
+float C2_FATOR_ALTO  = 2.00;  // faixa > 0.40A
 
-  const float V_POR_CNT  = VREF / ADC_MAX;
-
-  const float A_POR_V =
-      1000.0 / SENSIBILIDADE_MV_A;
-
-  double somaQuadrados = 0.0;
-
-  for (int i = 0; i < AMOSTRAS_RMS; i++) {
-
-    int adc = analogRead(pino);
-
-    float delta = (float)(adc - OFFSET_ADC);
-
-    float iInst =
-        delta * V_POR_CNT * A_POR_V;
-
-    somaQuadrados +=
-        (double)(iInst * iInst);
-  }
-
-  float irms =
-      sqrt(somaQuadrados / AMOSTRAS_RMS);
-
-  // Filtro de ruído
-  if (irms < 0.05f) {
-    irms = 0.0f;
-  }
-
-  return irms;
+// ─── CORREÇÃO POR FAIXA — C1 ─────────────────────────────────────
+float corrigirC1(float corrente) {
+  if (corrente <= 0.0)  return 0.0;
+  if (corrente < 0.20)  return corrente * C1_FATOR_BAIXO;
+  if (corrente < 0.40)  return corrente * C1_FATOR_MEDIO;
+  return corrente * C1_FATOR_ALTO;
 }
 
-// ====================================================
-// PROTEÇÃO DE SOBRECORRENTE
-// ====================================================
+// ─── CORREÇÃO POR FAIXA — C2 ─────────────────────────────────────
+float corrigirC2(float corrente) {
+  if (corrente <= 0.0)  return 0.0;
+  if (corrente < 0.20)  return corrente * C2_FATOR_BAIXO;
+  if (corrente < 0.40)  return corrente * C2_FATOR_MEDIO;
+  return corrente * C2_FATOR_ALTO;
+}
 
-void verificarSobrecarga(int circuito,
-                         float corrente) {
+// ─── CALIBRAÇÃO DINÂMICA DO OFFSET ───────────────────────────────
+void calibrarOffset() {
+  digitalWrite(RELE_C1,         HIGH);
+  digitalWrite(RELE_C2,         HIGH);
+  digitalWrite(LED_VERDE_C1,    HIGH);
+  digitalWrite(LED_VERMELHO_C1, LOW);
+  digitalWrite(LED_VERDE_C2,    HIGH);
+  digitalWrite(LED_VERMELHO_C2, LOW);
 
-  if (corrente > LIMITE_CORRENTE[circuito]) {
+  Serial.println("\n>>> CALIBRANDO — Relés em ON, sem carga! <<<");
+  delay(1000);
 
-    // Desliga o relé
-    digitalWrite(PINO_RELE[circuito], LOW);
+  for (int i = 0; i < 200; i++) {
+    analogRead(ACS_C1);
+    analogRead(ACS_C2);
+    delayMicroseconds(500);
+  }
 
-    releAtivo[circuito] = false;
+  const int RODADAS  = 3;
+  const int AMOSTRAS = 1000;
+  float somaZeroC1   = 0;
+  float somaZeroC2   = 0;
 
-    // Atualiza botão no app
-    Blynk.virtualWrite(V40 + circuito, 0);
-
-    if (!alertaDisparado[circuito]) {
-
-      String msg =
-          String("Sobrecarga no circuito ")
-          + NOME_CIRCUITO[circuito]
-          + " ("
-          + String(corrente, 1)
-          + " A)";
-
-      Blynk.logEvent("sobrecarga", msg);
-
-      Serial.println("[ALERTA] " + msg);
-
-      alertaDisparado[circuito] = true;
+  for (int r = 0; r < RODADAS; r++) {
+    long acumulaC1 = 0, acumulaC2 = 0;
+    for (int i = 0; i < AMOSTRAS; i++) {
+      acumulaC1 += analogRead(ACS_C1);
+      acumulaC2 += analogRead(ACS_C2);
+      delayMicroseconds(200);
     }
+    float mediaC1 = acumulaC1 / (float)AMOSTRAS;
+    float mediaC2 = acumulaC2 / (float)AMOSTRAS;
+    somaZeroC1 += mediaC1;
+    somaZeroC2 += mediaC2;
+    Serial.print("  Rodada "); Serial.print(r + 1);
+    Serial.print(" → C1: "); Serial.print(mediaC1, 1);
+    Serial.print(" | C2: "); Serial.println(mediaC2, 1);
+    delay(100);
+  }
 
-  } else {
+  float novoC1 = somaZeroC1 / RODADAS;
+  float novoC2 = somaZeroC2 / RODADAS;
 
-    alertaDisparado[circuito] = false;
+  if (abs(novoC1 - 2795) < 300) ADC_ZERO_C1 = novoC1;
+  else Serial.println("  ⚠️  C1: offset suspeito, mantendo 2795");
+
+  if (abs(novoC2 - 2795) < 300) ADC_ZERO_C2 = novoC2;
+  else Serial.println("  ⚠️  C2: offset suspeito, mantendo 2795");
+
+  Serial.print("\n>>> Offset FINAL C1: "); Serial.println(ADC_ZERO_C1, 2);
+  Serial.print(">>> Offset FINAL C2: "); Serial.println(ADC_ZERO_C2, 2);
+  Serial.println(">>> Calibração concluída! <<<\n");
+
+  calibrando = false;
+}
+
+// ─── LEITURA RMS ─────────────────────────────────────────────────
+float lerCorrenteRMS(int pino, float offset, float sensibilidade) {
+  analogRead(pino);
+  delay(5);
+
+  unsigned long tempoInicio = millis();
+  float somaQuadrados = 0;
+  long  n             = 0;
+
+  while ((millis() - tempoInicio) < 120) {
+    float diferenca  = (float)analogRead(pino) - offset;
+    somaQuadrados   += diferenca * diferenca;
+    n++;
+    delayMicroseconds(100);
+  }
+
+  float rmsADC    = sqrt(somaQuadrados / n);
+  float tensaoRMS = rmsADC * VOLTS_PER_STEP;
+  float corrente  = tensaoRMS / sensibilidade;
+
+  return (corrente < ZONA_MORTA) ? 0.0 : corrente;
+}
+
+// ─── PROTEÇÃO CONTRA SOBRECARGA ───────────────────────────────────
+void verificarProtecao() {
+  if (correnteC1 > limiteC1) {
+    digitalWrite(RELE_C1,         LOW);
+    digitalWrite(LED_VERDE_C1,    LOW);
+    digitalWrite(LED_VERMELHO_C1, HIGH);
+    Blynk.logEvent("sobrecarga", "Sobrecarga Circuito 1");
+    Serial.println("⚠️  SOBRECARGA C1 — Relé desligado!");
+  }
+  if (correnteC2 > limiteC2) {
+    digitalWrite(RELE_C2,         LOW);
+    digitalWrite(LED_VERDE_C2,    LOW);
+    digitalWrite(LED_VERMELHO_C2, HIGH);
+    Blynk.logEvent("sobrecarga", "Sobrecarga Circuito 2");
+    Serial.println("⚠️  SOBRECARGA C2 — Relé desligado!");
   }
 }
 
-// ====================================================
-// ENVIO DE DADOS AO BLYNK
-// ====================================================
-
-void enviarDadosBlynk(int circuito,
-                      float corrente) {
-
-  Blynk.virtualWrite(V0 + circuito,
-                     corrente);
-
-  Blynk.virtualWrite(V10 + circuito,
-                     energiaAcumulada[circuito]);
-}
-
-// ====================================================
-// ROTINA PRINCIPAL
-// ====================================================
-
-void sistema() {
-
-  unsigned long agora = millis();
-
-  float deltaHoras =
-      (agora - ultimaAtualizacao)
-      / 3600000.0;
-
-  ultimaAtualizacao = agora;
-
-  float energiaTotal = 0.0;
-
-  for (int i = 0; i < 4; i++) {
-
-    // =================================
-    // 1. Leitura RMS
-    // =================================
-
-    float corrente =
-        lerCorrenteRMS(PINO_SENSOR[i]);
-
-    // =================================
-    // 2. Potência elétrica
-    // =================================
-
-    float potencia =
-        corrente * TENSAO_REDE;
-
-    // =================================
-    // 3. Energia acumulada
-    // =================================
-
-    energiaAcumulada[i] +=
-        (potencia / 1000.0)
-        * deltaHoras;
-
-    energiaTotal +=
-        energiaAcumulada[i];
-
-    // =================================
-    // 4. Proteção
-    // =================================
-
-    verificarSobrecarga(i, corrente);
-
-    // =================================
-    // 5. Atualiza Blynk
-    // =================================
-
-    enviarDadosBlynk(i, corrente);
-
-    // =================================
-    // 6. Debug Serial
-    // =================================
-
-    Serial.printf(
-      "[%s] I=%.2fA  P=%.1fW  E=%.4fkWh\n",
-      NOME_CIRCUITO[i],
-      corrente,
-      potencia,
-      energiaAcumulada[i]
-    );
-  }
-
-  // =================================
-  // Totais gerais
-  // =================================
-
-  float custo =
-      energiaTotal * tarifa;
-
-  Blynk.virtualWrite(V30,
-                     energiaTotal);
-
-  Blynk.virtualWrite(V31,
-                     custo);
-
-  Serial.printf(
-      ">>> Total: %.4f kWh | R$ %.2f\n\n",
-      energiaTotal,
-      custo
-  );
-}
-
-// ====================================================
-// CALLBACKS BLYNK
-// ====================================================
-
-// Ajuste da tarifa
+// ─── CALLBACKS BLYNK ──────────────────────────────────────────────
 BLYNK_WRITE(V20) {
-
-  tarifa = param.asFloat();
-
-  if (tarifa <= 0.0f) {
-    tarifa = 0.01f;
-  }
-
-  Serial.printf(
-      "[Config] Tarifa: R$ %.4f/kWh\n",
-      tarifa
-  );
+  if (calibrando) return;
+  tarifaKwh = param.asFloat();
 }
 
-// Reset do consumo
-BLYNK_WRITE(V21) {
-
-  if (param.asInt() == 1) {
-
-    for (int i = 0; i < 4; i++) {
-      energiaAcumulada[i] = 0.0;
-    }
-
-    Serial.println(
-        "[Config] Energia resetada."
-    );
-
-    for (int i = 0; i < 4; i++) {
-
-      Blynk.virtualWrite(
-          V10 + i,
-          0.0
-      );
-    }
-
-    Blynk.virtualWrite(V30, 0.0);
-    Blynk.virtualWrite(V31, 0.0);
-  }
-}
-
-// Controle dos relés
 BLYNK_WRITE(V40) {
+  if (calibrando) return;
+  int estado = param.asInt();
+  digitalWrite(RELE_C1,         estado ? HIGH : LOW);
+  digitalWrite(LED_VERDE_C1,    estado ? HIGH : LOW);
+  digitalWrite(LED_VERMELHO_C1, estado ? LOW  : HIGH);
 
-  digitalWrite(
-      PINO_RELE[0],
-      param.asInt() ? HIGH : LOW
-  );
-
-  releAtivo[0] = param.asInt();
+    ultimoAcionamentoReleC1 = millis();
 }
 
 BLYNK_WRITE(V41) {
+  if (calibrando) return;
+  int estado = param.asInt();
+  digitalWrite(RELE_C2,         estado ? HIGH : LOW);
+  digitalWrite(LED_VERDE_C2,    estado ? HIGH : LOW);
+  digitalWrite(LED_VERMELHO_C2, estado ? LOW  : HIGH);
 
-  digitalWrite(
-      PINO_RELE[1],
-      param.asInt() ? HIGH : LOW
-  );
-
-  releAtivo[1] = param.asInt();
+    ultimoAcionamentoReleC2 = millis();
 }
 
-BLYNK_WRITE(V42) {
-
-  digitalWrite(
-      PINO_RELE[2],
-      param.asInt() ? HIGH : LOW
-  );
-
-  releAtivo[2] = param.asInt();
+BLYNK_WRITE(V21) {
+  if (calibrando) return;
+  if (param.asInt() == 1) {
+    energiaC1 = 0;
+    energiaC2 = 0;
+    Serial.println(">>> Energia zerada pelo usuário <<<");
+  }
 }
 
-BLYNK_WRITE(V43) {
+// ─── LÓGICA PRINCIPAL (executa a cada 2s) ────────────────────────
+void sistema() {
+  if (calibrando) return;
 
-  digitalWrite(
-      PINO_RELE[3],
-      param.asInt() ? HIGH : LOW
-  );
+  unsigned long agora = millis();
+  float deltaHoras    = (agora - ultimoTempo) / 3600000.0;
+  ultimoTempo         = agora;
 
-  releAtivo[3] = param.asInt();
+    // 1. Leitura RMS com sensibilidade individual
+  correnteC1 = lerCorrenteRMS(ACS_C1, ADC_ZERO_C1, SENSIBILIDADE_C1);
+  delay(5);
+  correnteC2 = lerCorrenteRMS(ACS_C2, ADC_ZERO_C2, SENSIBILIDADE_C2);
+
+  // 2. Filtro EMA
+  correnteFiltradaC1 = (correnteFiltradaC1 * 0.80) + (correnteC1 * 0.20);
+  correnteFiltradaC2 = (correnteFiltradaC2 * 0.80) + (correnteC2 * 0.20);
+
+  correnteC1 = correnteFiltradaC1;
+  correnteC2 = correnteFiltradaC2;
+
+  // 3. Correção por faixa
+  correnteC1 = corrigirC1(correnteC1);
+  correnteC2 = corrigirC2(correnteC2);
+
+  // 4. Zona morta
+const float LIMIAR_RUIDO = 0.08;
+
+if (correnteC1 < LIMIAR_RUIDO)
+  correnteC1 = 0;
+
+if (correnteC2 < LIMIAR_RUIDO)
+  correnteC2 = 0;
+
+// 5. Bloqueio por estado do relé
+if (digitalRead(RELE_C1) == LOW) {
+  correnteC1 = 0;
+  correnteFiltradaC1 = 0;
 }
 
-// ====================================================
-// SETUP
-// ====================================================
+if (digitalRead(RELE_C2) == LOW) {
+  correnteC2 = 0;
+  correnteFiltradaC2 = 0;
+}
 
-void setup() {
+// 5.1 Ignora leituras logo após acionar o relé
+if ((millis() - ultimoAcionamentoReleC1) < TEMPO_ESTABILIZACAO_RELE) {
+  correnteC1 = 0;
+  correnteFiltradaC1 = 0;
+}
 
-  Serial.begin(115200);
+if ((millis() - ultimoAcionamentoReleC2) < TEMPO_ESTABILIZACAO_RELE) {
+  correnteC2 = 0;
+  correnteFiltradaC2 = 0;
+}
 
-  Serial.println(
-      "\n=== Monitor Energético ESP32 ==="
-  );
+  // 6. Potência, energia e custo
+  potenciaC1 = (correnteC1 > 0) ? correnteC1 * TENSAO_REDE : 0.0;
+  potenciaC2 = (correnteC2 > 0) ? correnteC2 * TENSAO_REDE : 0.0;
 
-  // Configuração dos relés
-  for (int i = 0; i < 4; i++) {
+  energiaC1 += (potenciaC1 / 1000.0) * deltaHoras;
+  energiaC2 += (potenciaC2 / 1000.0) * deltaHoras;
 
-    pinMode(PINO_RELE[i], OUTPUT);
+  custoC1 = energiaC1 * tarifaKwh;
+  custoC2 = energiaC2 * tarifaKwh;
 
-    // Relé invertido:
-    // HIGH = ligado
-    digitalWrite(PINO_RELE[i], HIGH);
+  // 7. Proteção
+  verificarProtecao();
+
+  // 8. Envio Blynk
+  Blynk.virtualWrite(V0,  correnteC1);
+  Blynk.virtualWrite(V1,  correnteC2);
+  Blynk.virtualWrite(V50, potenciaC1);
+  Blynk.virtualWrite(V51, potenciaC2);
+  Blynk.virtualWrite(V10, energiaC1);
+  Blynk.virtualWrite(V11, energiaC2);
+  Blynk.virtualWrite(V60, custoC1);
+  Blynk.virtualWrite(V61, custoC2);
+  Blynk.virtualWrite(V30, energiaC1 + energiaC2);
+  Blynk.virtualWrite(V31, custoC1   + custoC2);
+  
+  // 9. Painel completo via Telnet (backup do Blynk)
+  if (telnetClient && telnetClient.connected()) {
+    telnetClient.println("\n==========================================");
+    telnetClient.println("      MONITOR ENERGÉTICO IoT - ESP32      ");
+    telnetClient.println("==========================================");
+
+    telnetClient.println("--- CIRCUITO 1 ---");
+    telnetClient.print("  Corrente : "); telnetClient.print(correnteC1, 2);   telnetClient.println(" A");
+    telnetClient.print("  Potência : "); telnetClient.print(potenciaC1, 1);   telnetClient.println(" W");
+    telnetClient.print("  Energia  : "); telnetClient.print(energiaC1,  4);   telnetClient.println(" kWh");
+    telnetClient.print("  Custo    : R$ ");                                    telnetClient.println(custoC1, 4);
+    telnetClient.print("  Status   : "); telnetClient.println(digitalRead(RELE_C1) ? "LIGADO" : "DESLIGADO");
+
+    telnetClient.println("--- CIRCUITO 2 ---");
+    telnetClient.print("  Corrente : "); telnetClient.print(correnteC2, 2);   telnetClient.println(" A");
+    telnetClient.print("  Potência : "); telnetClient.print(potenciaC2, 1);   telnetClient.println(" W");
+    telnetClient.print("  Energia  : "); telnetClient.print(energiaC2,  4);   telnetClient.println(" kWh");
+    telnetClient.print("  Custo    : R$ ");                                    telnetClient.println(custoC2, 4);
+    telnetClient.print("  Status   : "); telnetClient.println(digitalRead(RELE_C2) ? "LIGADO" : "DESLIGADO");
+
+    telnetClient.println("--- TOTAL GERAL ---");
+    telnetClient.print("  Corrente : "); telnetClient.print(correnteC1 + correnteC2, 2); telnetClient.println(" A");
+    telnetClient.print("  Potência : "); telnetClient.print(potenciaC1 + potenciaC2, 1); telnetClient.println(" W");
+    telnetClient.print("  Energia  : "); telnetClient.print(energiaC1  + energiaC2,  4); telnetClient.println(" kWh");
+    telnetClient.print("  Custo    : R$ ");                                               telnetClient.println(custoC1 + custoC2, 4);
+    telnetClient.print("  Tarifa   : R$ "); telnetClient.print(tarifaKwh, 2);            telnetClient.println("/kWh");
+    telnetClient.println("==========================================");
   }
 
-  // ADC em 12 bits
-  analogReadResolution(12);
-
-  // Conecta no Blynk
-  Blynk.begin(
-      BLYNK_AUTH_TOKEN,
-      WIFI_SSID,
-      WIFI_PASS
-  );
-
-  // Timer principal
-  ultimaAtualizacao = millis();
-
-  timer.setInterval(
-      INTERVALO_MS,
-      sistema
-  );
-
-  Serial.println(
-      "Sistema iniciado."
-  );
+  // 8. Monitor Serial
+  Serial.println("==========================================");
+  Serial.print("C1    | "); Serial.print(correnteC1, 2); Serial.print(" A | ");
+  Serial.print(potenciaC1, 1); Serial.print(" W | ");
+  Serial.print(energiaC1, 4); Serial.print(" kWh | R$ ");
+  Serial.println(custoC1, 4);
+  Serial.print("C2    | "); Serial.print(correnteC2, 2); Serial.print(" A | ");
+  Serial.print(potenciaC2, 1); Serial.print(" W | ");
+  Serial.print(energiaC2, 4); Serial.print(" kWh | R$ ");
+  Serial.println(custoC2, 4);
+  Serial.println("------------------------------------------");
+  Serial.print("TOTAL | ");
+  Serial.print(correnteC1 + correnteC2, 2); Serial.print(" A | ");
+  Serial.print(potenciaC1 + potenciaC2, 1); Serial.print(" W | ");
+  Serial.print(energiaC1  + energiaC2,  4); Serial.print(" kWh | R$ ");
+  Serial.println(custoC1  + custoC2,    4);
+  Serial.println("==========================================");
 }
 
-// ====================================================
-// LOOP PRINCIPAL
-// ====================================================
+// ─── SETUP ───────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
 
+  pinMode(RELE_C1,         OUTPUT);
+  pinMode(RELE_C2,         OUTPUT);
+  pinMode(LED_VERDE_C1,    OUTPUT);
+  pinMode(LED_VERMELHO_C1, OUTPUT);
+  pinMode(LED_VERDE_C2,    OUTPUT);
+  pinMode(LED_VERMELHO_C2, OUTPUT);
+
+  // Estado inicial: relés desligados, LEDs vermelhos (indica boot)
+  digitalWrite(RELE_C1,         LOW);
+  digitalWrite(RELE_C2,         LOW);
+  digitalWrite(LED_VERDE_C1,    LOW);
+  digitalWrite(LED_VERMELHO_C1, HIGH);
+  digitalWrite(LED_VERDE_C2,    LOW);
+  digitalWrite(LED_VERMELHO_C2, HIGH);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(ACS_C1, ADC_11db);
+  analogSetPinAttenuation(ACS_C2, ADC_11db);
+
+  // Calibração do offset (sem carga nos circuitos)
+  delay(500);
+  calibrarOffset();
+
+  // Conexão WiFi
+  WiFi.begin(ssid, pass);
+  Serial.print("Conectando ao WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("IP do ESP32: "); Serial.println(WiFi.localIP());
+
+  // Blynk
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  Blynk.connect();
+
+  // Telnet
+  telnetServer.begin();
+  telnetServer.setNoDelay(true);
+  Serial.print("Telnet disponível em: ");
+  Serial.print(WiFi.localIP()); Serial.println(":23");
+
+  ultimoTempo = millis();
+  timer.setInterval(2000L, sistema);
+
+}
+
+// ─── LOOP ────────────────────────────────────────────────────────
 void loop() {
+  // Gerencia conexão Telnet
+  if (telnetServer.hasClient()) {
+    if (telnetClient && telnetClient.connected()) {
+      WiFiClient novoCliente = telnetServer.available();
+      novoCliente.stop();
+    } else {
+      telnetClient = telnetServer.available();
+      Serial.println("Cliente Telnet conectado");
+      telnetClient.println("==========================================");
+      telnetClient.println("      MONITOR ENERGÉTICO IoT - ESP32      ");
+      telnetClient.println("      Conexão estabelecida com sucesso     ");
+      telnetClient.println("==========================================");
+    }
+  }
+
+  if (telnetClient && !telnetClient.connected()) {
+    telnetClient.stop();
+    Serial.println("Cliente Telnet desconectado");
+  }
 
   Blynk.run();
-
   timer.run();
 }
