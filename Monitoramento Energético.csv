@@ -1,0 +1,16 @@
+Pin,Nome do usuário,Tipo de dados,Semântica,Mínimo,Máximo,Padrão,Unidades,Usar em automações
+V0,Corrente C1,Double,,0,20,0,A,Nenhum
+V1,Corrente C2,Double,,0,20,0,A,Nenhum
+V50,Potencia C1,Double,,0,3000,0,W,Nenhum
+V51,Potencia C2,Double,,0,3000,0,W,Nenhum
+V10,Energia C1,Double,,0,9999,0,kWh,Nenhum
+V11,Energia C2,Double,,0,9999,0,kWh,Nenhum
+V60,Custo C1,Double,,0,99999,0,--,Nenhum
+V61,Custo C2,Double,,0,99999,0,--,Nenhum
+V30,Energia Total,Double,,0,99999,0,kWh,Nenhum
+V31,Custo Total,Double,,0,99999,0,--,Nenhum
+V40,Rele C1,Integer,,0,1,0,--,Nenhum
+V41,Rele C2,Integer,,0,1,0,--,Nenhum
+V20,Preco Tarifa,Double,,0,10,0.95,--,Nenhum
+V21,Resetar Kwh,Integer,,0,1,0,--,Nenhum
+V32,Corrente Total,Double,,0,20,0,Ah,Nenhum
